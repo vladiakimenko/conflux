@@ -1,0 +1,287 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+source "$SCRIPT_DIR/lib/common.sh"
+source "$SCRIPT_DIR/lib/validation.sh"
+source "$SCRIPT_DIR/lib/docker.sh"
+
+usage() {
+    cat <<'EOF'
+Conflux - TCP/UDP Forwarder Manager
+
+Usage:
+  ./forwarder add [options]
+  ./forwarder remove <name>
+  ./forwarder restart <name>
+  ./forwarder stop <name>
+  ./forwarder list
+  ./forwarder stop-all
+  ./forwarder remove-all
+  ./forwarder help
+
+Commands:
+
+  add             Create a new forwarder
+  remove          Remove a forwarder
+  restart         Restart a forwarder
+  stop            Stop a forwarder without removing it
+  list            List all managed forwarders
+  stop-all        Stop all running forwarders
+  remove-all      Remove all managed forwarders
+  help            Display this help
+
+Add options:
+
+  --name NAME             Unique forwarder name
+  --protocol PROTOCOL     tcp or udp
+  --listen-ip IP          Incoming IP (default: 0.0.0.0)
+  --listen-port PORT      Incoming port
+  --target-ip IP          Destination IPv4 address
+  --target-port PORT      Destination port
+  --replace               Replace an existing forwarder
+
+Examples:
+
+  ./forwarder add \
+    --name reality \
+    --protocol tcp \
+    --listen-port 31816 \
+    --target-ip 217.177.11.239 \
+    --target-port 31816
+
+  ./forwarder add \
+    --name grpc \
+    --protocol tcp \
+    --listen-port 50051 \
+    --target-ip 10.20.0.5 \
+    --target-port 443
+
+  ./forwarder add \
+    --name shadowsocks-udp \
+    --protocol udp \
+    --listen-port 39781 \
+    --target-ip 10.20.0.8 \
+    --target-port 8388
+
+  ./forwarder remove reality
+
+  ./forwarder list
+
+EOF
+}
+
+require_docker() {
+    command -v docker >/dev/null 2>&1 ||
+        die "Docker is not installed."
+
+    docker info >/dev/null 2>&1 ||
+        die "Cannot communicate with Docker. Check Docker permissions."
+}
+
+add_forwarder() {
+    local name=""
+    local protocol=""
+    local listen_ip="0.0.0.0"
+    local listen_port=""
+    local target_ip=""
+    local target_port=""
+    local replace=false
+
+    while (($#)); do
+        case "$1" in
+            --name)
+                (($# >= 2)) || die "Missing value for --name"
+                name="$2"
+                shift 2
+                ;;
+            --protocol)
+                (($# >= 2)) || die "Missing value for --protocol"
+                protocol="$2"
+                shift 2
+                ;;
+            --listen-ip)
+                (($# >= 2)) || die "Missing value for --listen-ip"
+                listen_ip="$2"
+                shift 2
+                ;;
+            --listen-port)
+                (($# >= 2)) || die "Missing value for --listen-port"
+                listen_port="$2"
+                shift 2
+                ;;
+            --target-ip)
+                (($# >= 2)) || die "Missing value for --target-ip"
+                target_ip="$2"
+                shift 2
+                ;;
+            --target-port)
+                (($# >= 2)) || die "Missing value for --target-port"
+                target_port="$2"
+                shift 2
+                ;;
+            --replace)
+                replace=true
+                shift
+                ;;
+            *)
+                die "Unknown option: $1"
+                ;;
+        esac
+    done
+
+    # Validate everything before touching Docker.
+
+    validate_name "$name"
+    validate_protocol "$protocol"
+    validate_ipv4 "$listen_ip"
+    validate_ipv4 "$target_ip"
+    validate_port "$listen_port"
+    validate_port "$target_port"
+
+    local container_name
+    container_name="$(container_name_for "$name")"
+
+    # Check for an existing container.
+
+    if docker container inspect "$container_name" >/dev/null 2>&1; then
+        if [[ "$replace" == true ]]; then
+            info "Replacing existing forwarder: $name"
+            remove_forwarder "$name"
+        else
+            die "Forwarder '$name' already exists. Use --replace to replace it."
+        fi
+    fi
+
+    info "Creating forwarder: $name"
+
+    create_forwarder \
+        "$name" \
+        "$protocol" \
+        "$listen_ip" \
+        "$listen_port" \
+        "$target_ip" \
+        "$target_port"
+
+    success "Forwarder '$name' created."
+}
+
+remove_command() {
+    [[ $# -eq 1 ]] ||
+        die "Usage: ./forwarder remove <name>"
+
+    validate_name "$1"
+    remove_forwarder "$1"
+
+    success "Forwarder '$1' removed."
+}
+
+restart_command() {
+    [[ $# -eq 1 ]] ||
+        die "Usage: ./forwarder restart <name>"
+
+    validate_name "$1"
+    restart_forwarder "$1"
+
+    success "Forwarder '$1' restarted."
+}
+
+stop_command() {
+    [[ $# -eq 1 ]] ||
+        die "Usage: ./forwarder stop <name>"
+
+    validate_name "$1"
+    stop_forwarder "$1"
+
+    success "Forwarder '$1' stopped."
+}
+
+stop_all_command() {
+    local ids
+
+    mapfile -t ids < <(
+        docker ps -q --filter "label=managed-by=$MANAGED_BY"
+    )
+
+    if ((${#ids[@]} == 0)); then
+        info "No running forwarders."
+        return
+    fi
+
+    docker stop "${ids[@]}"
+
+    success "All running forwarders stopped."
+}
+
+remove_all_command() {
+    local ids
+
+    mapfile -t ids < <(
+        docker ps -aq --filter "label=managed-by=$MANAGED_BY"
+    )
+
+    if ((${#ids[@]} == 0)); then
+        info "No forwarders to remove."
+        return
+    fi
+
+    echo "This will permanently remove all Conflux forwarders."
+    read -r -p "Continue? [y/N] " answer
+
+    [[ "$answer" =~ ^[Yy]$ ]] || {
+        info "Cancelled."
+        return
+    }
+
+    docker rm -f "${ids[@]}"
+
+    success "All forwarders removed."
+}
+
+main() {
+    local command="${1:-help}"
+    shift || true
+
+    # Help must work without Docker.
+
+    case "$command" in
+        help|-h|--help)
+            usage
+            return 0
+            ;;
+    esac
+
+    require_docker
+
+    case "$command" in
+        add)
+            add_forwarder "$@"
+            ;;
+        remove)
+            remove_command "$@"
+            ;;
+        restart)
+            restart_command "$@"
+            ;;
+        stop)
+            stop_command "$@"
+            ;;
+        list|status)
+            list_forwarders
+            ;;
+        stop-all)
+            stop_all_command
+            ;;
+        remove-all)
+            remove_all_command
+            ;;
+        *)
+            usage
+            die "Unknown command: $command"
+            ;;
+    esac
+}
+
+main "$@"
